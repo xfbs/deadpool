@@ -23,7 +23,13 @@
 
 mod config;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use rusqlite::{Connection as SqlConnection, Error as SqlError};
+use std::fmt::{Debug, Error as FmtError, Formatter};
+use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use deadpool::{
     async_trait,
@@ -43,6 +49,21 @@ deadpool::managed_reexports!(
     ConfigError
 );
 
+#[derive(Clone)]
+struct ConnectFunction(Arc<dyn Fn(PathBuf) -> Result<SqlConnection, SqlError> + Send + Sync>);
+
+impl Default for ConnectFunction {
+    fn default() -> Self {
+        ConnectFunction(Arc::new(|path| SqlConnection::open(path)))
+    }
+}
+
+impl Debug for ConnectFunction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
+        f.debug_struct("ConnectFunction").finish()
+    }
+}
+
 pub use self::config::{Config, ConfigError};
 
 /// Type alias for [`Object`]
@@ -56,6 +77,7 @@ pub struct Manager {
     config: Config,
     recycle_count: AtomicUsize,
     runtime: Runtime,
+    connect: ConnectFunction,
 }
 
 impl Manager {
@@ -67,18 +89,46 @@ impl Manager {
             config: config.clone(),
             recycle_count: AtomicUsize::new(0),
             runtime,
+            connect: ConnectFunction::default(),
         }
+    }
+
+    /// Overwrite the connection create function.
+    ///
+    /// By default, this function calls [Connection::open](rusqlite::Connection::open) to establish
+    /// a database connection. By overwriting it, you can add custom code to be run after
+    /// connecting, such as overriding built-in functions or enabling flags when opening the
+    /// database.
+    ///
+    /// ```rust
+    /// # use rusqlite::{Connection, OpenFlags};
+    /// # use deadpool_sqlite::Manager;
+    /// # use deadpool::Runtime;
+    /// let mut manager = Manager::from_config(&Default::default(), Runtime::Tokio1);
+    /// manager.set_connect_function(|path| {
+    ///     let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    ///     Ok(conn)
+    /// });
+    /// ```
+    pub fn set_connect_function<
+        F: Fn(PathBuf) -> Result<SqlConnection, SqlError> + Send + Sync + 'static,
+    >(
+        &mut self,
+        func: F,
+    ) {
+        self.connect = ConnectFunction(Arc::new(func));
     }
 }
 
 #[async_trait]
 impl managed::Manager for Manager {
-    type Type = SyncWrapper<rusqlite::Connection>;
-    type Error = rusqlite::Error;
+    type Type = SyncWrapper<SqlConnection>;
+    type Error = SqlError;
 
     async fn create(&self) -> Result<Self::Type, Self::Error> {
         let path = self.config.path.clone();
-        SyncWrapper::new(self.runtime, move || rusqlite::Connection::open(path)).await
+        let connect = self.connect.clone();
+        SyncWrapper::new(self.runtime, move || connect.0(path)).await
     }
 
     async fn recycle(&self, conn: &mut Self::Type) -> managed::RecycleResult<Self::Error> {
